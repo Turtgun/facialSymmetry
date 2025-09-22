@@ -67,17 +67,15 @@ class ExpSmoother:
             self.value = self.alpha * new_val + (1 - self.alpha) * self.value
         return self.value
 
-yaw_smoother = ExpSmoother(0.2)
-pitch_smoother = ExpSmoother(0.2)
-asym_smoother = ExpSmoother(0.3)
+asym_smoother = ExpSmoother(0.5)
 
 def calculate_distance(p1, p2):
     return np.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2 + (p1.z - p2.z) ** 2)
 
 # ==============================
-# Head Pose Estimation
+# Head Pose Estimation & Normalization
 # ==============================
-def get_head_pose(landmarks, frame_w, frame_h):
+def get_head_pose_and_normalized_distances(landmarks, frame_w, frame_h):
     image_points = np.array([
         (landmarks.landmark[NOSE_TIP_IDX].x * frame_w, landmarks.landmark[NOSE_TIP_IDX].y * frame_h),
         (landmarks.landmark[CHIN_IDX].x * frame_w, landmarks.landmark[CHIN_IDX].y * frame_h),
@@ -110,21 +108,31 @@ def get_head_pose(landmarks, frame_w, frame_h):
         (success, rotation_vector, translation_vector) = cv2.solvePnP(
             model_points, image_points, camera_matrix, dist_coeffs
         )
-        (rotation_matrix, _) = cv2.Rodrigues(rotation_vector)
+        
+        # Project 3D model points to 2D image plane to get pose-corrected distances
+        (projected_points, _) = cv2.projectPoints(
+            model_points, rotation_vector, translation_vector, camera_matrix, dist_coeffs
+        )
+        
+        # Calculate distances from detected landmarks
+        d_nose_le = np.linalg.norm(image_points[0] - image_points[2])
+        d_nose_re = np.linalg.norm(image_points[0] - image_points[3])
+        d_mouth = np.linalg.norm(image_points[4] - image_points[5])
+        
+        # Calculate expected distances from projected landmarks (pose-corrected)
+        proj_d_nose_le = np.linalg.norm(projected_points[0].ravel() - projected_points[2].ravel())
+        proj_d_nose_re = np.linalg.norm(projected_points[0].ravel() - projected_points[3].ravel())
+        proj_d_mouth = np.linalg.norm(projected_points[4].ravel() - projected_points[5].ravel())
+        
+        # Normalize the detected distances by the pose-corrected distances
+        normalized_nose_le_ratio = safe_div(d_nose_le, proj_d_nose_le)
+        normalized_nose_re_ratio = safe_div(d_nose_re, proj_d_nose_re)
+        normalized_mouth_ratio = safe_div(d_mouth, proj_d_mouth)
 
-        sy = np.sqrt(rotation_matrix[0, 0] ** 2 + rotation_matrix[1, 0] ** 2)
-        singular = sy < 1e-6
-
-        if not singular:
-            x = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2])
-            y = np.arctan2(-rotation_matrix[2, 0], sy)
-        else:
-            x = np.arctan2(-rotation_matrix[1, 2], rotation_matrix[1, 1])
-            y = np.arctan2(-rotation_matrix[2, 0], sy)
-
-        pitch = np.degrees(x)
-        yaw = np.degrees(y)
-        return yaw, pitch, True
+        # Use the ratio of these normalized values to check for asymmetry
+        eye_ratio = safe_div(normalized_nose_le_ratio, normalized_nose_re_ratio)
+        
+        return eye_ratio, normalized_mouth_ratio, True
     except cv2.error:
         return 0, 0, False
 
@@ -133,6 +141,10 @@ def get_head_pose(landmarks, frame_w, frame_h):
 # ==============================
 warning_counter = 0
 PERSISTENCE_THRESHOLD = 15
+
+# Thresholds (pose-invariant)
+EYE_THR = 1.15
+MOUTH_THR = 0.9
 
 while cap.isOpened():
     success, frame = cap.read()
@@ -151,42 +163,21 @@ while cap.isOpened():
     if results.multi_face_landmarks:
         face_landmarks = results.multi_face_landmarks[0]
 
-        yaw, pitch, pose_ok = get_head_pose(face_landmarks, img_w, img_h)
+        eye_ratio, mouth_ratio, pose_ok = get_head_pose_and_normalized_distances(face_landmarks, img_w, img_h)
         if pose_ok:
-            yaw = yaw_smoother.update(yaw)
-            pitch = pitch_smoother.update(pitch)
-
-            # Landmark distances
-            nose = face_landmarks.landmark[NOSE_TIP_IDX]
-            le, re = face_landmarks.landmark[LEFT_EYE_CORNER_IDX], face_landmarks.landmark[RIGHT_EYE_CORNER_IDX]
-            lm, rm = face_landmarks.landmark[LEFT_MOUTH_CORNER_IDX], face_landmarks.landmark[RIGHT_MOUTH_CORNER_IDX]
-
-            d_nose_le = calculate_distance(nose, le)
-            d_nose_re = calculate_distance(nose, re)
-            d_mouth = calculate_distance(lm, rm)
-            mouth_y_diff = abs(lm.y - rm.y)
-
-            eye_ratio = safe_div(d_nose_le, d_nose_re)
-            mouth_metric = safe_div(mouth_y_diff, d_mouth)
-
-            # Thresholds (baseline)
-            EYE_THR = 1.15
-            MOUTH_THR = 0.1
-
-            # allow more tolerance if yaw is high
-            yaw_factor = 1 + abs(yaw) * 0.005
-            print(yaw)
-            eye_thr = EYE_THR * yaw_factor
-            mouth_thr = MOUTH_THR * yaw_factor
-
             asym = 0
-            if eye_ratio > eye_thr or eye_ratio < 1 / eye_thr:
+            if eye_ratio > EYE_THR or eye_ratio < 1 / EYE_THR:
                 asym += 1
-            if mouth_metric > mouth_thr:
+            
+            # The original code's mouth metric was based on y-diff, which is less
+            # robust to pose. We now use the length of the mouth.
+            # A symmetric mouth should have a normalized ratio close to 1.
+            # A ratio significantly above 1 indicates an issue.
+            if mouth_ratio > MOUTH_THR:
                 asym += 1
 
             asym = asym_smoother.update(asym)
-
+            
             if asym > 0.5:  # Smoothed decision
                 warning_counter += 1
                 if warning_counter > PERSISTENCE_THRESHOLD:
